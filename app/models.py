@@ -355,6 +355,53 @@ class CaseReviewResponse(BaseModel):
     decisions: list[DecisionOut]
 
 
+# ---------- 处置结论更正 ----------
+
+
+class CaseCorrectionRequest(BaseModel):
+    """处置结论更正：原案件作废，以新案件号写入完整逐条处置。"""
+
+    original_case_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="处置结论录错的原案件号；更正后被替代，不得再用于新联单",
+    )
+    new_case_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="更正生成的新案件号；全库唯一，本身可继续被更正",
+    )
+    analysis_digest: str = Field(
+        ..., min_length=1,
+        description="原案件所属批次的当前分析摘要；与重算结果不一致返回 409",
+    )
+    decisions: list[DecisionIn] = Field(
+        ..., description="完整逐条处置；校验规则与处置复核一致"
+    )
+
+    @model_validator(mode="after")
+    def _validate_unique_seq(self) -> "CaseCorrectionRequest":
+        seqs = [d.seq for d in self.decisions]
+        if len(set(seqs)) != len(seqs):
+            raise ValueError("decisions 中 seq 不能重复")
+        return self
+
+
+class CaseCorrectionResponse(BaseModel):
+    batch_id: str = Field(..., description="原案件所属批次（新案件同属该批次）")
+    original_case_id: str = Field(..., description="被替代的原案件号")
+    case_id: str = Field(..., description="更正生成的新案件号")
+    analysis_digest: str
+    status: CaseStatus = Field(
+        ...,
+        description="新案件状态：全部异常为 resolved/dismissed 时 closed，否则 open",
+    )
+    cached: bool = Field(..., description="true 表示相同更正请求幂等回放")
+    decisions: list[DecisionOut]
+    affected_shipment_ids: list[str] = Field(
+        ...,
+        description="直接引用原案件的运输联单号（按联单号排序去重），供重新出具",
+    )
+
+
 # ---------- 运输联单风险快照 ----------
 
 
