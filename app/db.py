@@ -7,6 +7,11 @@
 比对快照、校验并写入案件处置行 / 联单批次行，任一步失败整体回滚
 （过期快照、缺失处置绝不落库）。联单落库后不可变更，相同联单号仅支持
 同内容幂等回放。
+
+处置结论录错时通过更正接口写入新案件，并在 ``case_corrections`` 记录
+替代关系（原案件 → 更正案件）：``original_case_id`` 主键保证同一原案件
+至多被更正一次，``new_case_id`` 唯一约束保证更正案件号不被复用；被替代
+案件不得再用于新联单，但已有联单保持历史快照。
 """
 
 from __future__ import annotations
@@ -125,6 +130,14 @@ def init_db() -> None:
                 handled_at REAL NOT NULL,
                 note       TEXT,
                 UNIQUE(case_id, seq)
+            );
+
+            CREATE TABLE IF NOT EXISTS case_corrections (
+                original_case_id TEXT PRIMARY KEY
+                                 REFERENCES cases(case_id),
+                new_case_id      TEXT NOT NULL UNIQUE
+                                 REFERENCES cases(case_id),
+                created_at       REAL NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS shipments (
@@ -403,6 +416,52 @@ def save_case(
         [(case_id, seq, decision, handled_at, note)
          for seq, decision, handled_at, note in decisions],
     )
+
+
+# ---------- 案件更正（替代关系） ----------
+
+
+def get_correction_for_update(
+    conn: sqlite3.Connection, original_case_id: str
+) -> Optional[dict[str, Any]]:
+    """事务内读取原案件的更正记录；未被更正过返回 None。
+
+    ``original_case_id`` 有唯一约束：同一原案件至多被更正替代一次，
+    并发更正只有一个能写入。
+    """
+    row = conn.execute(
+        """SELECT * FROM case_corrections WHERE original_case_id = ?""",
+        (original_case_id,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def save_correction(
+    conn: sqlite3.Connection, original_case_id: str, new_case_id: str
+) -> None:
+    """在给定事务内写入替代关系（原案件 → 更正案件）。
+
+    original_case_id 主键与 new_case_id 唯一约束冲突会抛
+    IntegrityError，由调用方按幂等/争用规则处理。
+    """
+    conn.execute(
+        """INSERT INTO case_corrections (original_case_id, new_case_id, created_at)
+           VALUES (?, ?, ?)""",
+        (original_case_id, new_case_id, time.time()),
+    )
+
+
+def select_shipment_ids_referencing_case(
+    conn: sqlite3.Connection, case_id: str
+) -> list[str]:
+    """事务内查询：直接引用指定案件的运输联单号（按联单号排序去重）。"""
+    rows = conn.execute(
+        """SELECT DISTINCT shipment_id FROM shipment_batches
+           WHERE case_id = ?
+           ORDER BY shipment_id""",
+        (case_id,),
+    ).fetchall()
+    return [r[0] for r in rows]
 
 
 # ---------- 运输联单 ----------

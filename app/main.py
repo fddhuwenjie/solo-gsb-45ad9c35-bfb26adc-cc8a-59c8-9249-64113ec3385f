@@ -30,9 +30,12 @@ from .models import (
     CalibrationProfileIn,
     CalibrationProfileResponse,
     CalibrationIntervalOut,
+    CaseCorrectionRequest,
+    CaseCorrectionResponse,
     CaseReviewRequest,
     CaseReviewResponse,
     CorrectionPreviewBatchOut,
+    DecisionIn,
     DecisionOut,
     ProfileCorrectionPreviewRequest,
     ProfileCorrectionPreviewResponse,
@@ -52,7 +55,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="冷链温区异常归因 API",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "按装卸/运输区段的温度上下限检测连续越界，容忍短暂回落、"
         "跨采样缺口拆段，并按异常区间内实际采样时刻数量将异常归因到"
@@ -62,6 +65,8 @@ app = FastAPI(
         "运输联单在同一事务内逐批次核对快照与案件处置后落库，"
         "给出 released/held 风险结论。校准档案拟更正预演在同一读取快照内"
         "以原档案与拟定区间分别重算各批次摘要，列出需重新核对的处置与联单。"
+        "处置结论录错时可提交更正：沿用复核规则在同一事务内写入新案件与"
+        "替代关系，被替代案件不得用于新联单，已有联单保持历史快照。"
     ),
     lifespan=lifespan,
 )
@@ -786,15 +791,22 @@ def preview_profile_correction(
 # ---------- 处置复核 ----------
 
 
-def _review_content_hash(req: CaseReviewRequest) -> str:
-    """处置请求体（含案件号、批次、摘要、逐条结论/时间/说明）的规范化哈希。
+def _case_content_hash(
+    batch_id: str,
+    case_id: str,
+    analysis_digest: str,
+    decisions: list[DecisionIn],
+) -> str:
+    """处置内容（案件号、批次、摘要、逐条结论/时间/说明）的规范化哈希。
 
-    相同 case_id 同内容回放必须逐字节一致；任一处置字段变化都会得到不同哈希。
+    复核与更正共用同一口径：相同案件号同内容回放必须逐字节一致；
+    任一处置字段变化都会得到不同哈希。更正落库的新案件因此也能被
+    复核接口按同内容幂等回放。
     """
     payload = {
-        "batch_id": req.batch_id,
-        "case_id": req.case_id,
-        "analysis_digest": req.analysis_digest,
+        "batch_id": batch_id,
+        "case_id": case_id,
+        "analysis_digest": analysis_digest,
         "decisions": [
             {
                 "seq": d.seq,
@@ -802,12 +814,70 @@ def _review_content_hash(req: CaseReviewRequest) -> str:
                 "handled_at": to_epoch(d.handled_at),
                 "note": d.note,
             }
-            for d in sorted(req.decisions, key=lambda d: d.seq)
+            for d in sorted(decisions, key=lambda d: d.seq)
         ],
     }
     canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False,
                            separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _review_content_hash(req: CaseReviewRequest) -> str:
+    """处置请求体的规范化哈希（与更正落库的新案件同一口径）。"""
+    return _case_content_hash(
+        req.batch_id, req.case_id, req.analysis_digest, req.decisions
+    )
+
+
+def _validate_decisions(
+    anomalies: list[dict[str, Any]], decisions: list[DecisionIn]
+) -> tuple[list[tuple[int, str, float, Optional[str]]], str]:
+    """按当前异常逐条校验处置，返回 (落库行, 案件状态)；复核与更正共用。
+
+    恰好覆盖全部当前异常、序号不重复（重复序号在模型层已拒绝，这里再按
+    当前序号集合复核）、dismissed 必填说明、handled_at 不早于异常结束；
+    任一不满足抛 422。全部 resolved/dismissed → closed，否则 open。
+    """
+    expected_seqs = set(range(len(anomalies)))
+    given_seqs = {d.seq for d in decisions}
+    if given_seqs != expected_seqs:
+        missing = sorted(expected_seqs - given_seqs)
+        extra = sorted(given_seqs - expected_seqs)
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"处置记录必须恰好覆盖全部当前异常（共 {len(anomalies)} 条）；"
+                f"缺失序号={missing}，越界序号={extra}"
+            ),
+        )
+
+    by_seq = {d.seq: d for d in decisions}
+    rows: list[tuple[int, str, float, Optional[str]]] = []
+    for seq, anomaly in enumerate(anomalies):
+        item = by_seq[seq]
+        handled_at = to_epoch(item.handled_at)
+        if handled_at < anomaly["end"]:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"序号 {seq} 的 handled_at 不得早于该异常结束时间 "
+                    f"{from_epoch(anomaly['end'])}"
+                ),
+            )
+        note = item.note.strip() if item.note else None
+        if item.decision == "dismissed" and not note:
+            raise HTTPException(
+                status_code=422,
+                detail=f"序号 {seq} 的 decision=dismissed 必须填写说明 note",
+            )
+        rows.append((seq, item.decision, handled_at, note))
+
+    status = (
+        "closed"
+        if all(d.decision in ("resolved", "dismissed") for d in decisions)
+        else "open"
+    )
+    return rows, status
 
 
 def _build_review_response(
@@ -887,49 +957,8 @@ def submit_case_review(req: CaseReviewRequest, response: Response) -> CaseReview
                 ),
             )
 
-        # 逐条校验：恰好覆盖全部当前异常、序号不重复
-        # （重复序号在模型层已拒绝，这里再按当前序号集合复核）
-        expected_seqs = set(range(len(anomalies)))
-        given_seqs = {d.seq for d in req.decisions}
-        if given_seqs != expected_seqs:
-            missing = sorted(expected_seqs - given_seqs)
-            extra = sorted(given_seqs - expected_seqs)
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"处置记录必须恰好覆盖全部当前异常（共 {len(anomalies)} 条）；"
-                    f"缺失序号={missing}，越界序号={extra}"
-                ),
-            )
-
-        by_seq = {d.seq: d for d in req.decisions}
-        rows: list[tuple[int, str, float, Optional[str]]] = []
-        for seq, anomaly in enumerate(anomalies):
-            item = by_seq[seq]
-            handled_at = to_epoch(item.handled_at)
-            if handled_at < anomaly["end"]:
-                raise HTTPException(
-                    status_code=422,
-                    detail=(
-                        f"序号 {seq} 的 handled_at 不得早于该异常结束时间 "
-                        f"{from_epoch(anomaly['end'])}"
-                    ),
-                )
-            note = item.note.strip() if item.note else None
-            if item.decision == "dismissed" and not note:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"序号 {seq} 的 decision=dismissed 必须填写说明 note",
-                )
-            rows.append((seq, item.decision, handled_at, note))
-
-        status = (
-            "closed"
-            if all(
-                d.decision in ("resolved", "dismissed") for d in req.decisions
-            )
-            else "open"
-        )
+        # 逐条校验：恰好覆盖全部当前异常、序号不重复、时间与说明合法
+        rows, status = _validate_decisions(anomalies, req.decisions)
 
         try:
             db.save_case(
@@ -967,6 +996,199 @@ def submit_case_review(req: CaseReviewRequest, response: Response) -> CaseReview
                  "handled_at": handled_at, "note": note}
                 for seq, decision, handled_at, note in rows
             ],
+            cached=False,
+        )
+    return result
+
+
+# ---------- 处置结论更正 ----------
+
+
+def _build_correction_response(
+    case: dict[str, Any],
+    decision_rows: list[dict[str, Any]],
+    original_case_id: str,
+    affected_shipment_ids: list[str],
+    cached: bool,
+) -> CaseCorrectionResponse:
+    return CaseCorrectionResponse(
+        batch_id=case["batch_id"],
+        original_case_id=original_case_id,
+        case_id=case["case_id"],
+        analysis_digest=case["analysis_digest"],
+        status=case["status"],
+        cached=cached,
+        decisions=[
+            DecisionOut(
+                seq=r["seq"],
+                decision=r["decision"],
+                handled_at=from_epoch(r["handled_at"]),
+                note=r["note"],
+            )
+            for r in sorted(decision_rows, key=lambda r: r["seq"])
+        ],
+        affected_shipment_ids=affected_shipment_ids,
+    )
+
+
+def _replay_correction_conn(
+    conn: Any,
+    correction: dict[str, Any],
+    content_hash: str,
+    req: CaseCorrectionRequest,
+    response: Response,
+) -> Optional[CaseCorrectionResponse]:
+    """已存在替代关系时判定幂等回放：同新案件号且同处置内容返回回放响应，
+    否则返回 None（由调用方按冲突拒绝）。
+    """
+    if correction["new_case_id"] != req.new_case_id:
+        return None
+    replacement = db.get_case_for_update(conn, correction["new_case_id"])
+    assert replacement is not None
+    if replacement["case"]["content_hash"] != content_hash:
+        return None
+    response.headers["X-Cache"] = "HIT"
+    return _build_correction_response(
+        replacement["case"],
+        replacement["decisions"],
+        req.original_case_id,
+        db.select_shipment_ids_referencing_case(conn, req.original_case_id),
+        cached=True,
+    )
+
+
+@app.post("/api/v1/cases/correction", response_model=CaseCorrectionResponse)
+def correct_case_review(
+    req: CaseCorrectionRequest, response: Response
+) -> CaseCorrectionResponse:
+    """处置结论更正：以新案件替代录错的原案件，新案件可继续更正。
+
+    服务沿用复核规则，在**同一 SQLite 事务**内完成：核对原案件所属批次 →
+    依据保存的原始采样重算异常并比对 ``analysis_digest``（过期返回 409，
+    绝不落库）→ 校验逐条处置（与复核同一套规则）→ 写入新案件与替代关系。
+    原案件已被其他更正替代、新案件号已被占用时同样整体拒绝，不留下部分
+    记录；争用同一原案件的并发更正只有一个成功。
+
+    相同原案件、新案件号与处置内容重复提交幂等回放；被替代案件不得用于
+    创建新联单（已有联单的内容与同号回放保持历史快照）。响应返回新案件
+    状态，并按联单号排序列出直接引用原案件的联单，供重新出具。
+    """
+    with db.transaction() as conn:
+        original = db.get_case_for_update(conn, req.original_case_id)
+        if original is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"案件 case_id={req.original_case_id} 不存在",
+            )
+        batch_id = original["case"]["batch_id"]
+        # 新案件与复核共用同一内容哈希口径：更正落库后，复核接口对
+        # 新案件号的同内容提交同样幂等回放。
+        content_hash = _case_content_hash(
+            batch_id, req.new_case_id, req.analysis_digest, req.decisions
+        )
+
+        # 同一原案件至多被更正替代一次：已有替代关系时同内容回放、换内容 409。
+        existing_correction = db.get_correction_for_update(
+            conn, req.original_case_id
+        )
+        if existing_correction is not None:
+            replay = _replay_correction_conn(
+                conn, existing_correction, content_hash, req, response
+            )
+            if replay is not None:
+                return replay
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"case_id={req.original_case_id} 已被更正案件 "
+                    f"{existing_correction['new_case_id']} 替代；"
+                    "同一案件只能被更正一次，如需再次更正请对替代案件提交"
+                ),
+            )
+
+        # 重算并在同一事务内比对摘要：快照过期直接 409（事务随异常回滚）。
+        batch_row = db._select_batch(conn, batch_id)
+        assert batch_row is not None  # cases.batch_id 外键保证批次存在
+        stored_batch = {
+            "batch": dict(batch_row),
+            "anomalies": db._select_anomalies(conn, batch_id),
+        }
+        _device_id, anomalies, profile_descriptor = _recompute_batch_conn(
+            conn, stored_batch
+        )
+        current_digest = _analysis_digest(anomalies, profile_descriptor)
+        if current_digest != req.analysis_digest:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "analysis_digest 与重算后的当前异常快照不一致；"
+                    "处置依据已过期，请重新获取分析结果后再提交"
+                ),
+            )
+
+        # 逐条校验：与复核同一套规则
+        rows, status = _validate_decisions(anomalies, req.decisions)
+
+        # 新案件号不得占用任何既有案件（含原案件自身与其他更正案件）
+        if db.get_case_for_update(conn, req.new_case_id) is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"case_id={req.new_case_id} 已被占用；"
+                    "更正必须使用未占用的新案件号"
+                ),
+            )
+
+        affected = db.select_shipment_ids_referencing_case(
+            conn, req.original_case_id
+        )
+        try:
+            db.save_case(
+                conn,
+                case_id=req.new_case_id,
+                batch_id=batch_id,
+                analysis_digest=current_digest,
+                content_hash=content_hash,
+                status=status,
+                decisions=rows,
+            )
+            db.save_correction(conn, req.original_case_id, req.new_case_id)
+        except sqlite3.IntegrityError as exc:
+            # 并发下争用同一原案件/新案件号：按已落库内容判定幂等/冲突
+            correction = db.get_correction_for_update(conn, req.original_case_id)
+            if correction is not None:
+                replay = _replay_correction_conn(
+                    conn, correction, content_hash, req, response
+                )
+                if replay is not None:
+                    return replay
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"case_id={req.original_case_id} 已被更正案件 "
+                        f"{correction['new_case_id']} 替代；"
+                        "同一案件只能被更正一次"
+                    ),
+                ) from exc
+            raise HTTPException(
+                status_code=409, detail="新案件号已被其他处置内容占用"
+            ) from exc
+
+        response.headers["X-Cache"] = "MISS"
+        result = _build_correction_response(
+            {
+                "case_id": req.new_case_id,
+                "batch_id": batch_id,
+                "analysis_digest": current_digest,
+                "status": status,
+            },
+            [
+                {"seq": seq, "decision": decision,
+                 "handled_at": handled_at, "note": note}
+                for seq, decision, handled_at, note in rows
+            ],
+            req.original_case_id,
+            affected,
             cached=False,
         )
     return result
@@ -1030,9 +1252,9 @@ def create_shipment_snapshot(
 
     服务在**同一 SQLite 事务**内对清单中每个批次：依据保存的原始采样重算
     异常并核对 ``analysis_digest``（过期即 409）→ 核对案件存在、属于该批次、
-    处置依据当前快照且覆盖全部当前异常（缺失/不匹配即 409）。交接时间严格
-    递增与批次不重复在请求模型层校验（422）。任一批次未通过校验时整个事务
-    回滚，绝不部分写入，错误详情可定位到具体清单项。
+    未被更正替代、处置依据当前快照且覆盖全部当前异常（缺失/不匹配/已替代
+    即 409）。交接时间严格递增与批次不重复在请求模型层校验（422）。任一
+    批次未通过校验时整个事务回滚，绝不部分写入，错误详情可定位到具体清单项。
 
     全部通过后保存不可变联单，按交接顺序返回各批次异常数与案件状态；存在
     open 案件时总体结果为 held，否则 released。相同 shipment_id 同内容幂等
@@ -1102,6 +1324,18 @@ def create_shipment_snapshot(
                     detail=(
                         f"{pos} 的案件 case_id={item.case_id} 实际属于批次 "
                         f"{case_row['batch_id']}，案件与批次不匹配"
+                    ),
+                )
+            # 被更正替代的案件不得用于新联单（已有联单走同号回放，
+            # 不会执行到这里，历史快照不受影响）。
+            superseding = db.get_correction_for_update(conn, item.case_id)
+            if superseding is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"{pos} 的案件 case_id={item.case_id} 已被更正案件 "
+                        f"{superseding['new_case_id']} 替代，不得用于新联单；"
+                        "请改用更正后的案件重新出具"
                     ),
                 )
             if case_row["analysis_digest"] != current_digest:

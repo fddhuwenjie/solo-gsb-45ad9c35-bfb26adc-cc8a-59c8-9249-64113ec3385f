@@ -26,6 +26,10 @@
   1～20 个批次，服务在同一 SQLite 读取快照内分别用原档案与拟定区间重算
   各批次异常与 `analysis_digest`，返回两份摘要、异常数与变化标记，并对
   摘要变化的批次列出需重新核对的处置案件与运输联单；纯只读，不落库
+- ✏️ 处置结论更正：处置录错时提交原 `case_id`、新 `case_id`、当前
+  `analysis_digest` 与完整逐条处置，服务沿用复核规则在同一事务内写入
+  新案件与替代关系；同一原案件只能被更正一次，被替代案件不得用于新联单，
+  已有联单保持历史快照，响应按联单号排序列出需重新出具的联单
 - 🗄️ SQLite 持久化（WAL 模式），无外部服务依赖
 - 📦 本地依赖：所有 wheel 在 `vendor/` 内，镜像构建**不需要访问外网 PyPI**
 
@@ -46,6 +50,7 @@ docker compose up --build -d
 | http://localhost:8000/api/v1/calibration-profiles | 设备温度校准档案（POST） |
 | http://localhost:8000/api/v1/calibration-profiles/correction-preview | 校准档案拟更正预演（POST，只读） |
 | http://localhost:8000/api/v1/cases/review | 处置复核提交（POST） |
+| http://localhost:8000/api/v1/cases/correction | 处置结论更正（POST） |
 | http://localhost:8000/api/v1/shipments/snapshot | 运输联单风险快照（POST） |
 
 停止：`docker compose down`（数据保留在命名卷 `coldchain-data`）。
@@ -475,6 +480,83 @@ curl -X POST http://localhost:8000/api/v1/cases/review \
   `handled_at` 早于异常结束、`dismissed` 缺少说明。
 - 批次不存在 → `404`。
 
+## 处置结论更正
+
+处置结论录错时，复核接口本身不可变更已落库案件；更正接口
+`POST /api/v1/cases/correction` 以**新案件**替代原案件：提交原
+`case_id`、新 `case_id`、原案件所属批次当前的 `analysis_digest` 与完整
+逐条处置。服务沿用复核规则，在**同一 SQLite 事务**内核对原案件所属批次、
+重算摘要并比对提交的摘要、校验逐条处置，然后写入新案件与替代关系
+（原案件 → 新案件）；新案件本身可继续被更正，形成更正链。
+
+```bash
+# 1) 重新获取原案件所属批次的当前摘要（快照过期会 409）
+DIGEST=$(curl -s http://localhost:8000/api/v1/batches/TRIP-001 | jq -r .analysis_digest)
+
+# 2) 提交更正：原案件 CASE-2026-09-22-01 的 seq-0 误录为 dismissed，
+#    更正为 resolved，新案件号 CASE-2026-09-22-02
+curl -X POST http://localhost:8000/api/v1/cases/correction \
+  -H 'Content-Type: application/json' \
+  -d "{
+    \"original_case_id\": \"CASE-2026-09-22-01\",
+    \"new_case_id\": \"CASE-2026-09-22-02\",
+    \"analysis_digest\": \"$DIGEST\",
+    \"decisions\": [
+      {\"seq\": 0, \"decision\": \"resolved\",
+       \"handled_at\": \"2026-09-22T08:10:00Z\",
+       \"note\": \"更正：确认为真实越界，现场已复冷\"}
+    ]
+  }"
+```
+
+请求字段：
+
+| 字段 | 说明 |
+| --- | --- |
+| `original_case_id` | 录错的原案件号；不存在返回 `404`，每个案件至多被更正替代一次 |
+| `new_case_id` | 更正后新案件号；不得与原案件号相同（`422`），不得占用任何既有案件号（`409`） |
+| `analysis_digest` | 原案件所属批次当前的分析摘要；与服务端重算结果不一致返回 `409`（快照过期） |
+| `decisions[]` | 逐条处置，规则与复核接口一致（恰好覆盖全部当前异常、`dismissed` 必填说明、`handled_at` 不早于异常 `end`） |
+
+成功响应（返回新案件状态，并按联单号排序列出直接引用原案件的联单）：
+
+```json
+{
+  "batch_id": "TRIP-001",
+  "original_case_id": "CASE-2026-09-22-01",
+  "case_id": "CASE-2026-09-22-02",
+  "analysis_digest": "a1f9…",
+  "status": "closed",
+  "cached": false,
+  "decisions": [
+    {"seq": 0, "decision": "resolved",
+     "handled_at": "2026-09-22T08:10:00.000Z",
+     "note": "更正：确认为真实越界，现场已复冷"}
+  ],
+  "affected_shipment_ids": ["SHP-2026-09-22-01"]
+}
+```
+
+更正语义与错误码：
+
+- **幂等回放**：相同原案件、新案件号与处置内容重复提交返回 `cached: true`、
+  `X-Cache: HIT`，不产生新记录；处置顺序不影响幂等判定。
+- **只能更正一次 `409`**：原案件已被其他更正替代（换案件号或换处置内容
+  再提交）时拒绝；如需再次更正，请对**替代案件**提交新的更正（更正链）。
+- **新案件号被占用 `409`**：`new_case_id` 与任何既有案件（含原案件自身
+  之外的案件）重复。
+- **快照过期 `409`** / **处置校验 `422`**：与复核接口同一口径；任一校验
+  失败整个事务回滚，新案件与替代关系均不落库。
+- **并发争用**：争用同一原案件的并发更正只有一个成功，其余按
+  幂等回放或 `409` 处理。
+- **联单约束**：被替代案件不得用于创建**新**联单（`409`，错误详情指明
+  替代案件号）；已有联单的内容与同号幂等回放保持历史快照不变。
+  `affected_shipment_ids` 列出直接引用原案件的联单（按联单号排序去重），
+  供改用更正案件重新出具。
+- **复核接口不受影响**：`POST /api/v1/cases/review` 对被替代案件与更正
+  落库的新案件均保持同内容幂等回放（更正案件与复核案件共用同一内容
+  哈希口径）。
+
 ## 运输联单风险快照
 
 联单接口为 `POST /api/v1/shipments/snapshot`。客户端按**交接顺序**提交批次
@@ -556,8 +638,10 @@ curl -X POST http://localhost:8000/api/v1/shipments/snapshot \
 - **总体结果**：全部案件 `closed` → `"released"`；存在 `open` 案件 → `"held"`。
 - **批次过期 `409`**：某项 `analysis_digest` 与同一事务内重算出的当前摘要
   不一致；事务回滚，联单与批次行均不落库。请重新获取分析结果后再提交。
-- **案件问题 `409`**：案件不存在（缺少处置）、案件属于其他批次、案件处置
-  依据的摘要与当前快照不一致、或处置未覆盖当前全部异常。
+- **案件问题 `409`**：案件不存在（缺少处置）、案件属于其他批次、案件已被
+  更正替代（详情指明替代案件号，请改用更正后的案件重新出具）、案件处置
+  依据的摘要与当前快照不一致、或处置未覆盖当前全部异常。已被替代的
+  案件仅影响**新**联单：已有联单的内容与同号幂等回放保持历史快照。
 - **换内容 `409`**：相同 `shipment_id` 已存在，但清单任一项（含顺序、案件、
   摘要、交接时间）与首次提交不同；联单不可变更，仅支持同内容幂等回放
   （回放响应 `cached: true`、`X-Cache: HIT`，首次提交为 `X-Cache: MISS`）。
@@ -606,11 +690,11 @@ COLDCHAIN_DB=/tmp/test.db .venv/bin/python -m unittest discover -s tests -v
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由、序列化、幂等编排、校准档案、拟更正预演、复核/联单事务
+│   ├── main.py        # FastAPI 路由、序列化、幂等编排、校准档案、拟更正预演、复核/更正/联单事务
 │   ├── detection.py   # 核心检测/合并/拆段/归因/校准算法（纯函数，无 IO）
 │   ├── models.py      # Pydantic 请求/响应模型与时间转换
-│   └── db.py          # SQLite 连接、建表、批次/案件/联单/档案读写与事务
-├── tests/             # unittest 算法与 API 测试（101 个用例，含校准档案、拟更正预演、快照绑定、复核与联单幂等）
+│   └── db.py          # SQLite 连接、建表、批次/案件/更正/联单/档案读写与事务
+├── tests/             # unittest 算法与 API 测试（117 个用例，含校准档案、拟更正预演、快照绑定、复核/更正与联单幂等）
 ├── vendor/            # 本地依赖 wheel（离线安装）
 ├── requirements.txt
 ├── Dockerfile         # pip --no-index 离线安装

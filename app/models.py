@@ -355,6 +355,61 @@ class CaseReviewResponse(BaseModel):
     decisions: list[DecisionOut]
 
 
+# ---------- 处置结论更正 ----------
+
+
+class CaseCorrectionRequest(BaseModel):
+    """处置结论更正：以新案件替代录错的原案件。
+
+    新案件沿用复核规则（绑定当前分析快照、逐条处置恰好覆盖全部当前异常），
+    原案件被标记为已替代：不得再用于新联单，也不得更正第二次。
+    """
+
+    original_case_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="录错的原案件号；每个案件至多被更正替代一次",
+    )
+    new_case_id: str = Field(
+        ..., min_length=1, max_length=128,
+        description="更正后新案件号；不得与任何既有案件（含原案件）重复",
+    )
+    analysis_digest: str = Field(
+        ..., min_length=1,
+        description="原案件所属批次当前的分析摘要，绑定更正时的确定快照",
+    )
+    decisions: list[DecisionIn] = Field(
+        ..., description="逐条异常处置；必须恰好覆盖当前全部异常且序号不重复"
+    )
+
+    @model_validator(mode="after")
+    def _validate_correction(self) -> "CaseCorrectionRequest":
+        seqs = [d.seq for d in self.decisions]
+        if len(set(seqs)) != len(seqs):
+            raise ValueError("decisions 中 seq 不能重复")
+        if self.new_case_id == self.original_case_id:
+            raise ValueError("new_case_id 必须与 original_case_id 不同")
+        return self
+
+
+class CaseCorrectionResponse(BaseModel):
+    batch_id: str = Field(..., description="原案件所属批次；更正案件沿用同一批次")
+    original_case_id: str = Field(..., description="被替代的原案件号")
+    case_id: str = Field(..., description="更正后新案件号")
+    analysis_digest: str
+    status: CaseStatus = Field(
+        ...,
+        description="新案件状态：全部异常为 resolved/dismissed 时 closed；存在 accepted 时 open",
+    )
+    cached: bool = Field(
+        ..., description="true 表示相同原案件、新案件号与处置内容重复提交的幂等回放"
+    )
+    decisions: list[DecisionOut]
+    affected_shipment_ids: list[str] = Field(
+        ...,
+        description="直接引用原案件的运输联单号（按联单号排序去重），供重新出具",
+    )
+
+
 # ---------- 运输联单风险快照 ----------
 
 
